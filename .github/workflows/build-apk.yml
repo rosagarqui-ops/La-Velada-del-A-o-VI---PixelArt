@@ -1,0 +1,122 @@
+name: Compilar APK (Android)
+
+# Se ejecuta solo al subir cambios a index.html / icon.png,
+# o a mano desde la pestaña "Actions" -> "Compilar APK (Android)" -> "Run workflow".
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'index.html'
+      - 'icon.png'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Preparar proyecto Capacitor
+        run: |
+          mkdir app-build
+          cp index.html icon.png app-build/
+          cd app-build
+          npm init -y > /dev/null
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/assets@3 peerjs@1.5.4 @fontsource/press-start-2p@5 sharp
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.rosagarquiops.velada6",
+            "appName": "La Velada del Año VI",
+            "webDir": "www",
+            "backgroundColor": "#0b0b14"
+          }
+          EOF
+          cat > make-www.js <<'EOF'
+          // Genera la carpeta www/ (versión sin internet) a partir del index.html online.
+          // Uso: node make-www.js <index.html de origen> <carpeta destino>
+          const fs = require('fs'), path = require('path');
+          const [src, out] = [process.argv[2] || 'index.html', process.argv[3] || 'www'];
+          let html = fs.readFileSync(src, 'utf8');
+          function swap(oldStr, newStr) {
+            if (!html.includes(oldStr)) throw new Error('No se encontró en el HTML: ' + oldStr.slice(0, 60));
+            html = html.replace(oldStr, () => newStr);
+          }
+          // Tipografía local (en vez de Google Fonts)
+          swap("@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');",
+               "@font-face { font-family: 'Press Start 2P'; src: url('fonts/press-start-2p.woff2') format('woff2'); font-display: block; }");
+          // PeerJS local (en vez del CDN) + marca de "versión app"
+          swap('<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>',
+               '<script src="peerjs.min.js"></script>\n    <script>window.VELADA_APP = true;</script>');
+          // En la app el juego siempre se ajusta al tamaño de la ventana
+          swap("(s < 1 || IS_TOUCH_DEVICE) ? `scale(${s})` : ''", "(s < 1 || IS_TOUCH_DEVICE || window.VELADA_APP) ? `scale(${s})` : ''");
+
+          fs.rmSync(out, { recursive: true, force: true });
+          fs.mkdirSync(path.join(out, 'fonts'), { recursive: true });
+          fs.writeFileSync(path.join(out, 'index.html'), html);
+          fs.copyFileSync(require.resolve('peerjs/dist/peerjs.min.js'), path.join(out, 'peerjs.min.js'));
+          fs.copyFileSync(path.join(path.dirname(require.resolve('@fontsource/press-start-2p/package.json')), 'files', 'press-start-2p-latin-400-normal.woff2'), path.join(out, 'fonts', 'press-start-2p.woff2'));
+          console.log('www listo en', out);
+          EOF
+          cat > make-icons.js <<'EOF'
+          const sharp = require('sharp'), fs = require('fs');
+          (async () => {
+            fs.mkdirSync('assets', { recursive: true });
+            const bg = { r: 20, g: 8, b: 11, alpha: 1 };
+            await sharp('icon.png').resize(1024, 1024, { fit: 'contain', background: bg }).png().toFile('assets/icon-only.png');
+            await sharp('assets/icon-only.png').resize(680, 680).extend({ top: 172, bottom: 172, left: 172, right: 172, background: { r: 0, g: 0, b: 0, alpha: 0 } }).png().toFile('assets/icon-foreground.png');
+            await sharp({ create: { width: 2732, height: 2732, channels: 4, background: { r: 20, g: 8, b: 11, alpha: 1 } } })
+            .composite([{ input: await sharp('assets/icon-only.png').resize(700, 700).toBuffer(), gravity: 'center' }]).png().toFile('assets/splash.png');
+          fs.copyFileSync('assets/splash.png', 'assets/splash-dark.png');
+          console.log('iconos listos');
+          })();
+          EOF
+          node make-www.js index.html www
+          node make-icons.js
+
+      - name: Crear proyecto Android e iconos
+        working-directory: app-build
+        run: |
+          npx cap add android
+          npx cap sync android
+          npx capacitor-assets generate --android --iconBackgroundColor '#140809' --iconBackgroundColorDark '#140809' --splashBackgroundColor '#140809' --splashBackgroundColorDark '#140809' || echo "AVISO: no se pudieron generar los iconos, se usará el icono por defecto"
+          # Juego en horizontal y a pantalla completa
+          sed -i 's|<activity|<activity android:screenOrientation="sensorLandscape"|' android/app/src/main/AndroidManifest.xml
+          sed -i '/<style name="AppTheme.NoActionBar"/a\        <item name="android:windowFullscreen">true</item>\n        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>' android/app/src/main/res/values/styles.xml
+          cat android/app/src/main/res/values/styles.xml
+
+      - name: Compilar APK
+        working-directory: app-build/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk ../../La-Velada-VI.apk
+
+      - name: Guardar APK como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: La-Velada-VI-apk
+          path: La-Velada-VI.apk
+
+      - name: Publicar APK en Releases
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" La-Velada-VI.apk \
+            --title "La Velada del Año VI - APK (build ${{ github.run_number }})" \
+            --notes "APK de Android generado automáticamente. Descárgalo e instálalo en tu móvil."
